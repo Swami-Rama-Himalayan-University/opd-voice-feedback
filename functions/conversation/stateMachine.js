@@ -4,28 +4,26 @@ const QUESTIONS = require('../config/questions');
 const db = () => admin.firestore();
 const SESSION_TTL_HOURS = 24;
 
-// Session doc lives at voiceSessions/{phone}
-// phone number is used as session ID so one active session per patient.
-
 async function getSession(phone) {
   const doc = await db().collection('voiceSessions').doc(phone).get();
   if (!doc.exists) return null;
   const data = doc.data();
-  // Expire sessions older than TTL
   const ageHours = (Date.now() - data.createdAt.toMillis()) / 3600000;
   if (ageHours > SESSION_TTL_HOURS) return null;
   return data;
 }
 
-async function createSession(phone, displayName) {
+// deptDoctorMap comes from Apps Script doGet — stored in the session so we
+// don't fetch it on every message.
+async function createSession(phone, displayName, deptDoctorMap) {
   const session = {
     phone,
     displayName: displayName || '',
     step: 0,
     answers: {},
+    deptDoctorMap,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     completedAt: null,
-    sheetRowWritten: false,
     channel: 'whatsapp',
   };
   await db().collection('voiceSessions').doc(phone).set(session);
@@ -36,25 +34,21 @@ async function deleteSession(phone) {
   await db().collection('voiceSessions').doc(phone).delete();
 }
 
-// Returns { reply, done } after processing a patient's answer.
-// reply: string to send back via WhatsApp
-// done: true when all questions answered and row written
+// Returns { reply, done, answers?, displayName? }
 async function processAnswer(phone, rawText) {
   const session = await getSession(phone);
-  if (!session) {
-    return { reply: null, done: false, notFound: true };
-  }
+  if (!session) return { reply: null, done: false, notFound: true };
 
-  const { step, answers, displayName } = session;
+  const { step, answers, deptDoctorMap, displayName } = session;
   const question = QUESTIONS[step];
-  const normalised = normalise(rawText, question);
+
+  // Resolve dynamic options at answer time
+  const resolvedOptions = resolveDynamicOptions(question, answers, deptDoctorMap);
+  const normalised = normalise(rawText, question, resolvedOptions);
 
   if (!normalised) {
-    // Invalid answer — re-ask with a hint
-    return {
-      reply: `⚠️ कृपया सही जवाब दें।\n\n${question.message}`,
-      done: false,
-    };
+    const hint = buildMessage(question, answers, deptDoctorMap);
+    return { reply: `⚠️ कृपया सही जवाब दें।\n\n${hint}`, done: false };
   }
 
   const newAnswers = { ...answers, [question.id]: normalised };
@@ -67,37 +61,63 @@ async function processAnswer(phone, rawText) {
     ...(done ? { completedAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
   });
 
-  if (done) {
-    return { reply: null, done: true, answers: newAnswers, displayName };
-  }
+  if (done) return { done: true, answers: newAnswers, displayName };
 
   return {
-    reply: QUESTIONS[nextStep].message,
+    reply: buildMessage(QUESTIONS[nextStep], newAnswers, deptDoctorMap),
     done: false,
   };
 }
 
-// Maps raw patient text to a valid answer value, or null if unrecognisable.
-function normalise(raw, question) {
+// Build the message for a question, substituting {options} for dynamic questions.
+function buildMessage(question, answers, deptDoctorMap) {
+  if (question.type !== 'dynamic') return question.message;
+  const opts = resolveDynamicOptions(question, answers, deptDoctorMap);
+  const optionLines = opts.map((o, i) => `${i + 1}️⃣ ${o}`).join('\n');
+  return question.message.replace('{options}', optionLines);
+}
+
+// For dynamic questions, return the list of valid string options.
+function resolveDynamicOptions(question, answers, deptDoctorMap) {
+  if (question.type !== 'dynamic') return null;
+  if (question.id === 'opdDepartment') {
+    return Object.keys(deptDoctorMap).sort();
+  }
+  if (question.id === 'doctorName') {
+    const dept = answers.opdDepartment;
+    return (deptDoctorMap[dept] || []);
+  }
+  return [];
+}
+
+// Map raw patient text to a valid answer value, or null if unrecognisable.
+function normalise(raw, question, dynamicOptions) {
   const trimmed = raw.trim();
 
-  if (question.type === 'text') {
-    return trimmed.length > 0 ? trimmed : null;
+  if (question.type === 'text') return trimmed.length > 0 ? trimmed : null;
+
+  if (question.type === 'dynamic') {
+    // Patient can reply with a number (1, 2, 3…) or type the name
+    const idx = parseInt(trimmed, 10);
+    if (!isNaN(idx) && idx >= 1 && idx <= dynamicOptions.length) {
+      return dynamicOptions[idx - 1];
+    }
+    // Try case-insensitive text match
+    const match = dynamicOptions.find(
+      o => o.toLowerCase() === trimmed.toLowerCase()
+    );
+    return match || null;
   }
 
-  // For choice and yesNo, look up in the options map (case-insensitive)
-  const key = trimmed.toLowerCase();
+  // choice / yesNo — look up in options map
   const options = question.options || {};
-
-  // Try exact match first
+  const key = trimmed.toLowerCase();
   if (options[trimmed] !== undefined) return options[trimmed];
-  // Try lowercase match
   if (options[key] !== undefined) return options[key];
-  // Try first word only (e.g. patient types "Good morning" → "good")
   const firstWord = key.split(/\s+/)[0];
   if (options[firstWord] !== undefined) return options[firstWord];
 
   return null;
 }
 
-module.exports = { getSession, createSession, deleteSession, processAnswer };
+module.exports = { getSession, createSession, deleteSession, processAnswer, buildMessage };
