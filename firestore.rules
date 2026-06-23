@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // voiceSessions are written only by Cloud Functions (service account).
+    // No client-side reads or writes allowed.
+    match /voiceSessions/{sessionId} {
+      allow read, write: if false;
+    }
+  }
+}
